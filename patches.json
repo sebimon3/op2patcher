@@ -1,0 +1,61 @@
+[
+  {
+    "id": "focus_pause",
+    "name": "Keep game running when unfocused",
+    "description": "NOPs the two focus-loss Device.Pause calls in xrGame.dll. Esc/script/menu pauses remain intact; audio continues while alt-tabbed.",
+    "type": "memory",
+    "patches": [
+      {
+        "dllName": "xrGame.dll",
+        "rva": "0x7ca121",
+        "expected": "FF1529E23B00",
+        "enabled": "909090909090",
+        "description": "Single-player focus-loss pause call"
+      },
+      {
+        "dllName": "xrGame.dll",
+        "rva": "0x7ca14a",
+        "expected": "FF1500E23B00",
+        "enabled": "909090909090",
+        "description": "Multiplayer focus-loss pause call"
+      }
+    ]
+  },
+  {
+    "id": "cursor_clip",
+    "name": "Confine cursor to game window",
+    "description": "Clips the OS cursor to the game window while focused and releases it on focus loss. Fixes wheel events leaking to a second monitor.",
+    "type": "code_stub",
+    "dllName": "XR_3DA.exe",
+    "hookRva": "0x6FF00",
+    "expected": "4C8BDC534154",
+    "hwndRva": "0x14B5D0",
+    "activeRva": "0x14B5F8",
+    "iatRvas": {
+      "GetWindowRect": "0xED428",
+      "GetModuleHandleA": "0xED1A8",
+      "GetProcAddress": "0xED190"
+    },
+    "immOffsets": [
+      17,
+      35,
+      51,
+      90,
+      100,
+      112,
+      125,
+      174
+    ],
+    "stringOffsets": [
+      184,
+      195
+    ],
+    "stub": "50515241504151415241534883EC6848B8D0B5144001000000488B08488D54242048B828D40E4001000000FF1085C0741E48B8F8B5144001000000448B104585D2740C4C8D4C24204C894C2430EB0948C74424300000000048B9B8E038400100000048B8A8D10E4001000000FF1048BAC3E03840010000004889C148B890D10E4001000000FF104885C07407488B4C2430FFD04883C468415B415A415941585A59584883C4084989E353415448B806FF064001000000FFE07573657233322E646C6C00436C6970437572736F7200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+  },
+  {
+    "id": "windows_keyboard_layout",
+    "name": "Use Windows keyboard layout",
+    "description": "Prevents game-driven layout switching and uses the active Windows layout for console/save-name text. Text fields show OS instead of the game's EN/RU/UK selector. Gameplay bindings are unchanged. Applies next launch; supported stock build only.",
+    "type": "keyboard_layout"
+  }
+]

@@ -1,0 +1,13 @@
+/build/
+/dist/
+/staging/
+config.json
+*.user
+*.pdb
+*.obj
+*.o
+*.exe
+*.dll
+*.zip
+__pycache__/
+*.py[cod]

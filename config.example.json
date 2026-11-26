@@ -1,0 +1,20 @@
+{
+  "gameExe": "",
+  "workingDir": "",
+  "enabled": [],
+  "fov": {
+    "enabled": false,
+    "desired": 67.5,
+    "step": 2.5,
+    "presets": [67.5, 80.0, 90.0],
+    "bindings": {
+      "decrease": [],
+      "increase": [],
+      "restore": [],
+      "preset1": [],
+      "preset2": [],
+      "preset3": []
+    },
+    "hotkeyEnabled": false
+  }
+}
