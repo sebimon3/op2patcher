@@ -6,6 +6,19 @@
 namespace hotkeys {
 namespace {
 constexpr int modifiers[] = {VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN};
+int injectedHoldKey = 0;
+bool injectedHoldExternallyDown = false;
+InjectedHoldReader injectedHoldReader = nullptr;
+void* injectedHoldContext = nullptr;
+
+int normalized_state_key(int key) {
+    switch (key) {
+    case VK_LSHIFT: case VK_RSHIFT: return VK_SHIFT;
+    case VK_LCONTROL: case VK_RCONTROL: return VK_CONTROL;
+    case VK_LMENU: case VK_RMENU: return VK_MENU;
+    default: return key;
+    }
+}
 
 bool contains(const Binding& binding, int key) {
     return std::find(binding.keys.begin(), binding.keys.end(), key) != binding.keys.end();
@@ -89,7 +102,39 @@ State sample() {
     State state{};
     for (int key = 8; key <= 254; ++key)
         if (bindable(key)) state[(size_t)key] = (GetAsyncKeyState(key) & 0x8000) != 0;
+    int holdKey = injectedHoldKey;
+    bool externallyDown = injectedHoldExternallyDown;
+    if (injectedHoldReader) injectedHoldReader(injectedHoldContext, holdKey, externallyDown);
+    if (holdKey > 0 && holdKey < (int)state.size()) {
+        int otherSide = 0;
+        switch (holdKey) {
+        case VK_LSHIFT: otherSide = VK_RSHIFT; break;
+        case VK_RSHIFT: otherSide = VK_LSHIFT; break;
+        case VK_LCONTROL: otherSide = VK_RCONTROL; break;
+        case VK_RCONTROL: otherSide = VK_LCONTROL; break;
+        case VK_LMENU: otherSide = VK_RMENU; break;
+        case VK_RMENU: otherSide = VK_LMENU; break;
+        default: break;
+        }
+        if (otherSide) externallyDown = externallyDown || (GetAsyncKeyState(otherSide) & 0x8000) != 0;
+        state[(size_t)normalized_state_key(holdKey)] = externallyDown;
+    }
     return state;
+}
+
+void set_injected_hold(int virtualKey, bool externallyDown) {
+    if (virtualKey == 0) {
+        injectedHoldKey = 0;
+        injectedHoldExternallyDown = false;
+        return;
+    }
+    injectedHoldKey = virtualKey > 0 && virtualKey < 256 ? virtualKey : 0;
+    injectedHoldExternallyDown = injectedHoldKey != 0 && externallyDown;
+}
+
+void set_injected_hold_reader(InjectedHoldReader reader, void* context) {
+    injectedHoldReader = reader;
+    injectedHoldContext = context;
 }
 
 void Matcher::reset() { armed_ = false; previous_ = {}; }

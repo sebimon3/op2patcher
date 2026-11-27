@@ -17,6 +17,7 @@
 #include "mini_json.h"
 #include "patcher.h"
 #include "fov_controller.h"
+#include "autowalk.h"
 #include "style.h"
 #include "game_paths.h"
 
@@ -50,9 +51,16 @@ static AppState g_app;
 // One controller for the whole app; its lifetime is independent of tab selection
 // and of the ImGui/D3D render state.
 static fov::Controller g_fov;
+// Owns the launched child handle independently of Dynamic FOV and keeps the
+// single-game session guard active even when Autowalk itself is disabled.
+static autowalk::Controller g_autowalk;
 
 static fov::Settings g_fovOpts;
+static autowalk::Settings g_autowalkOpts;
+static std::string g_autowalkWarning;
 static hotkeys::Capture g_keyCapture;
+enum class CaptureTarget { None, FovAction, AutowalkToggle };
+static CaptureTarget g_captureTarget = CaptureTarget::None;
 static int g_captureAction = -1;
 static bool g_openCapture = false;
 static std::string g_captureMessage;
@@ -61,6 +69,8 @@ static std::string g_captureMessage;
 // request to focus the InputText as soon as it appears.
 static std::string g_editField;
 static bool g_editFocusPending = false;
+
+static const char* fov_action_name(int action);
 
 static std::string app_dir() {
     char path[MAX_PATH]{};
@@ -109,6 +119,49 @@ static void autodetect_paths() {
     std::snprintf(g_app.workingDir, MAX_PATH, "%s", paths.workingDir.c_str());
 }
 
+static bool valid_binding_value(const JsonValue* value) {
+    if (!value || value->type != JsonValue::Array || value->array.size() > hotkeys::kMaxKeys) return false;
+    hotkeys::Binding candidate;
+    for (const JsonValue& key : value->array) {
+        if (key.type != JsonValue::Number || !std::isfinite(key.number) ||
+            key.number < 8 || key.number > 254 || (double)(int)key.number != key.number) return false;
+        candidate.keys.push_back((int)key.number);
+    }
+    return hotkeys::normalize(candidate);
+}
+
+static bool valid_autowalk_config(const JsonValue* value) {
+    if (!value || value->type != JsonValue::Object) return false;
+    if (const JsonValue* enabled = value->find("enabled"))
+        if (enabled->type != JsonValue::Bool) return false;
+    const JsonValue* toggle = value->find("toggleBinding");
+    return valid_binding_value(toggle);
+}
+
+static void load_autowalk_config(const JsonValue* value) {
+    g_autowalkOpts = autowalk::Settings{};
+    g_autowalkWarning.clear();
+    if (!value) return;
+    if (!valid_autowalk_config(value)) {
+        g_autowalkWarning = "Invalid Autowalk settings were disabled and unbound.";
+        return;
+    }
+
+    autowalk::Settings loaded;
+    autowalk::load_settings(value, loaded);
+    if (!loaded.toggle.keys.empty()) {
+        for (int i = 0; i < hotkeys::kActionCount; ++i) {
+            if (g_fovOpts.bindings[(size_t)i].keys.empty()) continue;
+            if (autowalk::conflicts(loaded.toggle, g_fovOpts.bindings[(size_t)i])) {
+                g_autowalkWarning = std::string("Autowalk toggle conflicts with ") +
+                    fov_action_name(i) + "; Autowalk was disabled and unbound.";
+                return;
+            }
+        }
+    }
+    g_autowalkOpts = loaded;
+}
+
 static void load_config() {
     std::string text = read_file(join_path(app_dir(), "config.json"));
     JsonValue root;
@@ -150,6 +203,7 @@ static void load_config() {
             }
         }
     }
+    load_autowalk_config(root.find("autowalk"));
 }
 
 static void save_config() {
@@ -165,6 +219,7 @@ static void save_config() {
         first = false;
     }
     out += "],\n";
+    out += "  \"autowalk\": " + autowalk::settings_json(g_autowalkOpts) + ",\n";
     out += "  \"fov\": " + fov::settings_json(g_fovOpts) + "\n}\n";
     write_file(join_path(app_dir(), "config.json"), out);
 }
@@ -212,7 +267,7 @@ static void cleanup_device() {
 static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     // While recording a chord, keys are sampled directly; don't let them also
     // activate ImGui navigation or trigger the launcher's Alt+F4 handling.
-    if (g_captureAction >= 0 && (msg == WM_KEYDOWN || msg == WM_KEYUP ||
+    if (g_captureTarget != CaptureTarget::None && (msg == WM_KEYDOWN || msg == WM_KEYUP ||
         msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP || msg == WM_CHAR || msg == WM_SYSCHAR)) return 0;
     if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wParam, lParam)) return 1;
     switch (msg) {
@@ -237,8 +292,9 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             }
             return 0;
         case WM_DESTROY:
-            // Closing the launcher ends runtime FOV control but never kills the
-            // game; any value already written stays in the running process.
+            // Detach runtime controllers before the window/render teardown. Both
+            // controllers close only their handles; neither terminates the game.
+            g_autowalk.detach();
             g_fov.detach();
             PostQuitMessage(0);
             return 0;
@@ -362,6 +418,7 @@ static void binding_control(int action) {
     ImGui::PushID(action);
     const std::string label = hotkeys::describe(g_fovOpts.bindings[(size_t)action]);
     if (ImGui::Button((label + "##binding").c_str(), ImVec2(170, 0))) {
+        g_captureTarget = CaptureTarget::FovAction;
         g_captureAction = action;
         g_keyCapture.reset();
         g_captureMessage.clear();
@@ -377,13 +434,36 @@ static void binding_control(int action) {
     ImGui::PopID();
 }
 
+static void autowalk_binding_control() {
+    ImGui::PushID("autowalk_toggle_binding");
+    const std::string label = hotkeys::describe(g_autowalkOpts.toggle);
+    if (ImGui::Button((label + "##binding").c_str(), ImVec2(170, 0))) {
+        g_captureTarget = CaptureTarget::AutowalkToggle;
+        g_captureAction = -1;
+        g_keyCapture.reset();
+        g_captureMessage.clear();
+        g_openCapture = true;
+        ImGui::GetIO().ClearInputKeys();
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Click to record: %s", label.c_str());
+    ImGui::SameLine();
+    if (ImGui::Button("Clear")) {
+        g_autowalkOpts.toggle.keys.clear();
+        g_autowalkWarning.clear();
+        save_config();
+    }
+    ImGui::PopID();
+}
+
 static void render_capture_popup() {
     if (g_openCapture) {
         ImGui::OpenPopup("Record shortcut");
         g_openCapture = false;
     }
     if (!ImGui::BeginPopupModal("Record shortcut", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) return;
-    ImGui::Text("Binding: %s", fov_action_name(g_captureAction));
+    const bool capturingFov = g_captureTarget == CaptureTarget::FovAction &&
+        g_captureAction >= 0 && g_captureAction < hotkeys::kActionCount;
+    ImGui::Text("Binding: %s", capturingFov ? fov_action_name(g_captureAction) : "Autowalk toggle");
     ImGui::TextUnformatted("Press one key, or hold a combination, then release all keys.");
     ImGui::TextUnformatted("Up to 8 keyboard keys; click Cancel to keep the old binding.");
     const auto& candidate = g_keyCapture.candidate();
@@ -391,21 +471,40 @@ static void render_capture_popup() {
     if (g_keyCapture.too_many()) ImGui::TextColored(ImVec4(1, .45f, .3f, 1), "Too many keys; release and try again.");
     if (!g_captureMessage.empty()) ImGui::TextColored(ImVec4(1, .45f, .3f, 1), "%s", g_captureMessage.c_str());
     hotkeys::Binding captured;
-    if (g_captureAction >= 0 && g_keyCapture.poll(GetForegroundWindow() == g_hwnd, hotkeys::sample(), captured)) {
+    if (g_captureTarget != CaptureTarget::None && g_keyCapture.poll(GetForegroundWindow() == g_hwnd, hotkeys::sample(), captured)) {
         int conflict = -1;
-        for (int i = 0; i < hotkeys::kActionCount; ++i)
-            if (i != g_captureAction && hotkeys::equal(captured, g_fovOpts.bindings[(size_t)i])) { conflict = i; break; }
+        bool conflictsWithAutowalk = false;
+        for (int i = 0; i < hotkeys::kActionCount; ++i) {
+            if (capturingFov && i == g_captureAction) continue;
+            const bool matches = capturingFov
+                ? hotkeys::equal(captured, g_fovOpts.bindings[(size_t)i])
+                : autowalk::conflicts(captured, g_fovOpts.bindings[(size_t)i]);
+            if (matches && !g_fovOpts.bindings[(size_t)i].keys.empty()) { conflict = i; break; }
+        }
+        if (capturingFov && conflict < 0 && !g_autowalkOpts.toggle.keys.empty() &&
+            autowalk::conflicts(captured, g_autowalkOpts.toggle)) conflictsWithAutowalk = true;
         if (conflict >= 0) {
-            g_captureMessage = std::string("Already assigned to ") + fov_action_name(conflict) + "; choose another.";
+            g_captureMessage = capturingFov
+                ? std::string("Already assigned to ") + fov_action_name(conflict) + "; choose another."
+                : std::string("Conflicts with ") + fov_action_name(conflict) + "; choose another.";
+        } else if (conflictsWithAutowalk) {
+            g_captureMessage = "Conflicts with the Autowalk toggle; choose another.";
         } else {
-            g_fovOpts.bindings[(size_t)g_captureAction] = captured;
+            if (capturingFov) {
+                g_fovOpts.bindings[(size_t)g_captureAction] = captured;
+            } else {
+                g_autowalkOpts.toggle = captured;
+                g_autowalkWarning.clear();
+            }
             save_config();
+            g_captureTarget = CaptureTarget::None;
             g_captureAction = -1;
             ImGui::GetIO().ClearInputKeys();
             ImGui::CloseCurrentPopup();
         }
     }
     if (ImGui::Button("Cancel")) {
+        g_captureTarget = CaptureTarget::None;
         g_captureAction = -1;
         g_keyCapture.reset();
         ImGui::GetIO().ClearInputKeys();
@@ -512,9 +611,39 @@ static void render_fov_tab() {
     }
 
     ImGui::TextWrapped("Shortcuts only work while the game is foreground. They are non-consuming and may conflict with game or Windows keys.");
-    render_capture_popup();
     ImGui::PopStyleVar(); // FramePadding
     ImGui::PopStyleVar(); // ItemSpacing
+}
+
+static void render_autowalk_tab() {
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8, TOP_SECTION_GAP));
+    ImGui::TextUnformatted("Autowalk");
+    ImGui::Separator();
+    if (ImGui::Checkbox("Enable Autowalk", &g_autowalkOpts.enabled)) save_config();
+    ImGui::TextWrapped(
+        "Press the assigned toggle in-game to start or stop walking. Autowalk stops and disarms "
+        "when the game loses focus, is paused, or enters a menu/text input; press the toggle again to resume. "
+        "Pressing forward or backward cancels it; strafing is allowed. Keep this launcher open while playing.");
+
+    ImGui::TextUnformatted("Toggle hotkey");
+    ImGui::SameLine(120);
+    autowalk_binding_control();
+
+    if (!g_autowalkWarning.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, .65f, .3f, 1));
+        ImGui::TextWrapped("Autowalk settings: %s", g_autowalkWarning.c_str());
+        ImGui::PopStyleColor();
+    }
+
+    ImGui::Separator();
+    ImGui::Text("Status: %s", g_autowalk.status().c_str());
+    ImGui::Text("State: %s | %s", g_autowalk.ready() ? "ready" : "not ready",
+        g_autowalk.walking() ? "walking" : "off");
+    const std::string& forward = g_autowalk.forward_key();
+    const std::string& backward = g_autowalk.backward_key();
+    ImGui::Text("Forward: %s", forward.empty() ? "unavailable" : forward.c_str());
+    ImGui::Text("Backward: %s", backward.empty() ? "unavailable" : backward.c_str());
+    ImGui::PopStyleVar();
 }
 
 static void render_ui() {
@@ -576,10 +705,10 @@ static void render_ui() {
             ImGui::SameLine(rightX - launchW);
             if (style::colored_button(buttonLabel.c_str(), ImVec4(0.30f, 0.12f, 0.12f, 1.0f),
                                       ImVec2(launchW, 0))) {
-                if (g_fov.attached()) {
-                    // Only block a second launch while the FOV-controlled child
-                    // is actually alive; Controller::tick() clears attach on exit.
-                    g_app.status = "Close the running game before launching again (Dynamic FOV is attached).";
+                if (g_autowalk.attached()) {
+                    // The Autowalk controller owns the primary child handle
+                    // regardless of whether its feature is enabled.
+                    g_app.status = "Close the running game before launching again (a game session is attached).";
                 } else {
                     g_app.log.clear();
                     g_app.launchFailed = false;
@@ -589,24 +718,44 @@ static void render_ui() {
                     HANDLE childProcess = nullptr;
                     DWORD childPid = 0;
                     bool fovInstalled = false;
+                    bool fovControllerAttached = false;
                     std::string fovWarning;
                     bool ok = patcher::launch_game(g_app.exePath, g_app.workingDir, selected,
                         g_app.definitions, g_app.log, fatal,
-                        wantFov ? &childProcess : nullptr,
-                        wantFov ? &childPid : nullptr, wantFov, &fovInstalled, &fovWarning);
-                    if (ok && wantFov && fovInstalled) {
-                        g_fov.detach();
-                        g_fov.attach(childProcess, childPid);
-                    } else if (childProcess) {
-                        CloseHandle(childProcess);
+                        &childProcess, &childPid, wantFov, &fovInstalled, &fovWarning);
+                    HANDLE fovProcess = nullptr;
+                    if (ok && childProcess && wantFov && fovInstalled) {
+                        if (!DuplicateHandle(GetCurrentProcess(), childProcess, GetCurrentProcess(),
+                                             &fovProcess, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+                            if (!fovWarning.empty()) fovWarning += " ";
+                            fovWarning += "FOV support was installed, but its controller handle could not be duplicated (Win32 " +
+                                std::to_string(GetLastError()) + ").";
+                        }
                     }
+                    if (ok && childProcess) {
+                        g_fov.detach();
+                        g_autowalk.detach();
+                        g_autowalk.attach(childProcess, childPid);
+                        childProcess = nullptr; // primary handle ownership transferred
+                        if (fovProcess) {
+                            g_fov.attach(fovProcess, childPid);
+                            fovProcess = nullptr; // FOV controller owns the duplicate
+                            fovControllerAttached = true;
+                        }
+                    }
+                    if (childProcess) CloseHandle(childProcess);
+                    if (fovProcess) CloseHandle(fovProcess);
                     g_app.fovWarning = fovWarning;
                     if (ok && wantFov && !fovInstalled && g_app.fovWarning.empty())
                         g_app.fovWarning = "Support was not installed; the game launched without Dynamic FOV.";
+                    if (ok && !g_autowalk.attached()) {
+                        if (!g_app.fovWarning.empty()) g_app.fovWarning += " ";
+                        g_app.fovWarning += "The game launched, but its process handle could not be retained.";
+                    }
                     save_config();
                     if (ok) {
                         g_app.status = "Launched with " + std::to_string(selected.size()) + " patch(es)." +
-                            (wantFov && fovInstalled ? " Dynamic FOV control attached." : "");
+                            (fovControllerAttached ? " Dynamic FOV control attached." : "");
                     } else {
                         g_app.launchFailed = true;
                         g_app.status = "Launch failed: " + fatal;
@@ -698,24 +847,32 @@ static void render_ui() {
             render_fov_tab();
             style::end_padded_tab_item();
         }
+        if (style::begin_padded_tab_item("Others")) {
+            render_autowalk_tab();
+            style::end_padded_tab_item();
+        }
         style::end_padded_tab_bar();
     }
+    render_capture_popup();
     ImGui::End();
 }
 
 // A fullscreen D3D9 game can leave the launcher's device lost for the entire
-// session. Keep the previous 50 ms device/message retry cadence, but sample
-// enabled FOV shortcuts at roughly 10 ms intervals so ordinary short taps are
-// less likely to be missed while the launcher's rendering is suspended.
+// session. Keep the previous 50 ms device/message retry cadence while both
+// runtime controllers continue polling at roughly 10 ms intervals.
 static void wait_for_device() {
     const ULONGLONG until = GetTickCount64() + 50;
     do {
         Sleep(10);
-        if (g_fov.attached() && g_fovOpts.hotkeysEnabled) g_fov.tick(g_fovOpts);
+        g_autowalk.tick(g_autowalkOpts);
+        g_fov.tick(g_fovOpts);
     } while (GetTickCount64() < until);
 }
 
-int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR commandLine, int nCmdShow) {
+    const int workerExitCode = autowalk::worker_command(commandLine);
+    if (workerExitCode >= 0) return workerExitCode;
+
     // Be DPI-aware so the 800x600 layout stays true on scaled displays.
     if (HMODULE user32 = GetModuleHandleA("user32.dll")) {
         using Fn = BOOL (WINAPI *)(void*);
@@ -789,8 +946,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         }
         if (!running) break;
 
-        // Runtime FOV hotkeys and exit detection must run on every UI loop,
-        // regardless of the active tab or the state of the D3D device.
+        // Runtime controllers and process-exit detection run independently of
+        // the active tab and D3D device. Autowalk updates the injected-key
+        // filter before FOV samples the shared hotkey state.
+        g_autowalk.tick(g_autowalkOpts);
         g_fov.tick(g_fovOpts);
 
         ImGui_ImplDX9_NewFrame();
@@ -833,6 +992,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         else Sleep(8);
     }
 
+    // Stop Autowalk and release its session handle before tearing down UI or
+    // graphics state. detach() is idempotent with WM_DESTROY.
+    g_autowalk.detach();
+    g_fov.detach();
     ImGui_ImplDX9_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();

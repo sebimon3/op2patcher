@@ -16,5 +16,9 @@
       "preset3": []
     },
     "hotkeyEnabled": false
+  },
+  "autowalk": {
+    "enabled": false,
+    "toggleBinding": []
   }
 }

@@ -274,7 +274,8 @@ function Compile-And-Link([string] $Output, [string[]] $Inputs, [string[]] $Flag
 $production = @(
     'main.cpp', 'game_paths.cpp', 'patcher.cpp', 'wide_fov_patch.cpp',
     'keyboard_layout_patch.cpp', 'startup_debugger.cpp',
-    'fov_controller.cpp', 'fov_settings.cpp', 'hotkeys.cpp', 'mini_json.cpp', 'style.cpp'
+    'fov_controller.cpp', 'fov_settings.cpp', 'autowalk.cpp', 'autowalk_state.cpp',
+    'hotkeys.cpp', 'mini_json.cpp', 'style.cpp'
 ) | ForEach-Object { Join-Path $src $_ }
 $imguiSources = @(
     'imgui.cpp', 'imgui_draw.cpp', 'imgui_tables.cpp', 'imgui_widgets.cpp',

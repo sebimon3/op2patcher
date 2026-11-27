@@ -21,6 +21,14 @@ bool normalize(Binding& binding);
 bool equal(const Binding& a, const Binding& b);
 std::string describe(const Binding& binding);
 State sample();
+// While a synthetic hold is owned, replace only its sampled key state with
+// the corresponding physical state so it cannot retrigger launcher hotkeys.
+// Passing virtualKey == 0 clears the override.
+void set_injected_hold(int virtualKey, bool externallyDown);
+// Optional live provider avoids a cross-process timing gap between the UI tick
+// and sampling. Called only by the UI thread; clear before freeing its context.
+using InjectedHoldReader = void (*)(void* context, int& virtualKey, bool& externallyDown);
+void set_injected_hold_reader(InjectedHoldReader reader, void* context);
 
 // Arming requires all configured keys to be released after focus is gained or
 // hotkeys are enabled. A key-down edge, never auto-repeat, triggers an action.
