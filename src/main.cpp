@@ -646,6 +646,77 @@ static void render_autowalk_tab() {
     ImGui::PopStyleVar();
 }
 
+static std::vector<std::string> selected_patch_ids() {
+    std::vector<std::string> selected;
+    for (size_t k = 0; k < g_app.definitions.size(); ++k) {
+        if (g_app.enabled[k]) selected.push_back(g_app.definitions[k].str("id"));
+    }
+    return selected;
+}
+
+static void render_launch_button(const std::vector<std::string>& selected) {
+    std::string buttonLabel = "Launch (" + std::to_string(selected.size()) + ")";
+    if (style::colored_button(buttonLabel.c_str(), ImVec4(0.30f, 0.12f, 0.12f, 1.0f),
+                              ImVec2(110.0f, 0))) {
+        if (g_autowalk.attached()) {
+            // The Autowalk controller owns the primary child handle
+            // regardless of whether its feature is enabled.
+            g_app.status = "Close the running game before launching again (a game session is attached).";
+        } else {
+            g_app.log.clear();
+            g_app.launchFailed = false;
+            g_app.fovWarning.clear();
+            std::string fatal;
+            const bool wantFov = g_fovOpts.enabledForNextLaunch;
+            HANDLE childProcess = nullptr;
+            DWORD childPid = 0;
+            bool fovInstalled = false;
+            bool fovControllerAttached = false;
+            std::string fovWarning;
+            bool ok = patcher::launch_game(g_app.exePath, g_app.workingDir, selected,
+                g_app.definitions, g_app.log, fatal,
+                &childProcess, &childPid, wantFov, &fovInstalled, &fovWarning);
+            HANDLE fovProcess = nullptr;
+            if (ok && childProcess && wantFov && fovInstalled) {
+                if (!DuplicateHandle(GetCurrentProcess(), childProcess, GetCurrentProcess(),
+                                     &fovProcess, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+                    if (!fovWarning.empty()) fovWarning += " ";
+                    fovWarning += "FOV support was installed, but its controller handle could not be duplicated (Win32 " +
+                        std::to_string(GetLastError()) + ").";
+                }
+            }
+            if (ok && childProcess) {
+                g_fov.detach();
+                g_autowalk.detach();
+                g_autowalk.attach(childProcess, childPid);
+                childProcess = nullptr; // primary handle ownership transferred
+                if (fovProcess) {
+                    g_fov.attach(fovProcess, childPid);
+                    fovProcess = nullptr; // FOV controller owns the duplicate
+                    fovControllerAttached = true;
+                }
+            }
+            if (childProcess) CloseHandle(childProcess);
+            if (fovProcess) CloseHandle(fovProcess);
+            g_app.fovWarning = fovWarning;
+            if (ok && wantFov && !fovInstalled && g_app.fovWarning.empty())
+                g_app.fovWarning = "Support was not installed; the game launched without Dynamic FOV.";
+            if (ok && !g_autowalk.attached()) {
+                if (!g_app.fovWarning.empty()) g_app.fovWarning += " ";
+                g_app.fovWarning += "The game launched, but its process handle could not be retained.";
+            }
+            save_config();
+            if (ok) {
+                g_app.status = "Launched with " + std::to_string(selected.size()) + " patch(es)." +
+                    (fovControllerAttached ? " Dynamic FOV control attached." : "");
+            } else {
+                g_app.launchFailed = true;
+                g_app.status = "Launch failed: " + fatal;
+            }
+        }
+    }
+}
+
 static void render_ui() {
     ImGuiIO& io = ImGui::GetIO();
     ImGui::SetNextWindowPos(ImVec2(0, 0));
@@ -654,14 +725,20 @@ static void render_ui() {
         ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoTitleBar;
     ImGui::Begin("##Main", nullptr, flags);
 
-    if (style::begin_padded_tab_bar("main_tabs")) {
+    const std::vector<std::string> selected = selected_patch_ids();
+    const ImVec2 headerOrigin = ImGui::GetCursorScreenPos();
+    // Keep the shared action fixed when tab contents gain/lose a scrollbar.
+    const float headerRight = ImGui::GetWindowPos().x + ImGui::GetWindowWidth() -
+        ImGui::GetStyle().WindowPadding.x - 1.0f;
+    if (style::begin_padded_tab_bar("main_tabs", 118.0f)) {
+        const ImVec2 contentCursor = ImGui::GetCursorPos();
+        ImGui::SetCursorScreenPos(ImVec2(headerRight - 110.0f, headerOrigin.y));
+        render_launch_button(selected);
+        ImGui::SetCursorPos(contentCursor);
+
         if (style::begin_padded_tab_item("Patches")) {
             ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8, TOP_SECTION_GAP));
 
-            std::vector<std::string> selected;
-            for (size_t k = 0; k < g_app.definitions.size(); ++k) {
-                if (g_app.enabled[k]) selected.push_back(g_app.definitions[k].str("id"));
-            }
             // Snap every info line to the same 18px grid so the Copy button's
             // extra height cannot make the first gap bigger than the rest.
             ImVec2 infoPos = ImGui::GetCursorPos();
@@ -697,71 +774,6 @@ static void render_ui() {
                 g_app.status = "All patches disabled.";
                 save_config();
             }
-            // Right-align the primary Launch button in the remaining space.
-            std::string buttonLabel = "Launch (" + std::to_string(selected.size()) + ")";
-            float launchW = ImGui::CalcTextSize(buttonLabel.c_str()).x +
-                ImGui::GetStyle().FramePadding.x * 2.0f + 2.0f;
-            float rightX = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x;
-            ImGui::SameLine(rightX - launchW);
-            if (style::colored_button(buttonLabel.c_str(), ImVec4(0.30f, 0.12f, 0.12f, 1.0f),
-                                      ImVec2(launchW, 0))) {
-                if (g_autowalk.attached()) {
-                    // The Autowalk controller owns the primary child handle
-                    // regardless of whether its feature is enabled.
-                    g_app.status = "Close the running game before launching again (a game session is attached).";
-                } else {
-                    g_app.log.clear();
-                    g_app.launchFailed = false;
-                    g_app.fovWarning.clear();
-                    std::string fatal;
-                    const bool wantFov = g_fovOpts.enabledForNextLaunch;
-                    HANDLE childProcess = nullptr;
-                    DWORD childPid = 0;
-                    bool fovInstalled = false;
-                    bool fovControllerAttached = false;
-                    std::string fovWarning;
-                    bool ok = patcher::launch_game(g_app.exePath, g_app.workingDir, selected,
-                        g_app.definitions, g_app.log, fatal,
-                        &childProcess, &childPid, wantFov, &fovInstalled, &fovWarning);
-                    HANDLE fovProcess = nullptr;
-                    if (ok && childProcess && wantFov && fovInstalled) {
-                        if (!DuplicateHandle(GetCurrentProcess(), childProcess, GetCurrentProcess(),
-                                             &fovProcess, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
-                            if (!fovWarning.empty()) fovWarning += " ";
-                            fovWarning += "FOV support was installed, but its controller handle could not be duplicated (Win32 " +
-                                std::to_string(GetLastError()) + ").";
-                        }
-                    }
-                    if (ok && childProcess) {
-                        g_fov.detach();
-                        g_autowalk.detach();
-                        g_autowalk.attach(childProcess, childPid);
-                        childProcess = nullptr; // primary handle ownership transferred
-                        if (fovProcess) {
-                            g_fov.attach(fovProcess, childPid);
-                            fovProcess = nullptr; // FOV controller owns the duplicate
-                            fovControllerAttached = true;
-                        }
-                    }
-                    if (childProcess) CloseHandle(childProcess);
-                    if (fovProcess) CloseHandle(fovProcess);
-                    g_app.fovWarning = fovWarning;
-                    if (ok && wantFov && !fovInstalled && g_app.fovWarning.empty())
-                        g_app.fovWarning = "Support was not installed; the game launched without Dynamic FOV.";
-                    if (ok && !g_autowalk.attached()) {
-                        if (!g_app.fovWarning.empty()) g_app.fovWarning += " ";
-                        g_app.fovWarning += "The game launched, but its process handle could not be retained.";
-                    }
-                    save_config();
-                    if (ok) {
-                        g_app.status = "Launched with " + std::to_string(selected.size()) + " patch(es)." +
-                            (fovControllerAttached ? " Dynamic FOV control attached." : "");
-                    } else {
-                        g_app.launchFailed = true;
-                        g_app.status = "Launch failed: " + fatal;
-                    }
-                }
-            }
             ImGui::PopStyleVar(); // FramePadding
 
             static char search[128] = "";
@@ -793,31 +805,43 @@ static void render_ui() {
                     ImGui::TableNextRow();
                     ImGui::TableSetColumnIndex(0);
                     bool selected = g_app.enabled[k];
-                    std::string rowLabel = name + (selected ? "  (selected)" : "");
                     const std::string description = def.str("description");
-                    if (!description.empty()) rowLabel += "  (?)";
                     ImVec2 cellMin = ImGui::GetCursorScreenPos();
                     if (ImGui::InvisibleButton("##patch_row", ImVec2(-1, PATCH_ROW_HEIGHT))) {
                         g_app.enabled[k] = !g_app.enabled[k];
                         save_config();
                     }
                     ImDrawList* dl = ImGui::GetWindowDrawList();
-                    if (ImGui::IsItemHovered()) {
+                    const bool rowHovered = ImGui::IsItemHovered();
+                    if (rowHovered) {
                         dl->AddRectFilled(cellMin,
                             ImVec2(cellMin.x + ImGui::GetColumnWidth(), cellMin.y + PATCH_ROW_HEIGHT),
                             ImGui::GetColorU32(ImGuiCol_HeaderHovered, 0.35f));
-                        if (!description.empty()) {
-                            ImGui::BeginTooltip();
-                            ImGui::PushTextWrapPos(ImGui::GetFontSize() * 35.0f);
-                            ImGui::TextUnformatted(description.c_str());
-                            ImGui::PopTextWrapPos();
-                            ImGui::EndTooltip();
-                        }
                     }
                     const float lineH = ImGui::GetTextLineHeight();
-                    dl->AddText(ImVec2(cellMin.x + 2.0f,
-                                       cellMin.y + (PATCH_ROW_HEIGHT - lineH) * 0.5f),
-                                ImGui::GetColorU32(green), rowLabel.c_str());
+                    const ImVec2 namePos(cellMin.x + 2.0f,
+                        cellMin.y + (PATCH_ROW_HEIGHT - lineH) * 0.5f);
+                    const ImVec4 patchNameColor = selected ? green : off;
+                    dl->AddText(namePos, ImGui::GetColorU32(patchNameColor), name.c_str());
+                    bool hintHovered = false;
+                    if (!description.empty()) {
+                        const ImVec2 nameSize = ImGui::CalcTextSize(name.c_str());
+                        const ImVec2 hintPos(namePos.x + nameSize.x + 5.0f, namePos.y);
+                        const ImVec2 hintSize = ImGui::CalcTextSize("(?)");
+                        const ImVec2 mouse = ImGui::GetIO().MousePos;
+                        const float cellRight = cellMin.x + ImGui::GetColumnWidth();
+                        hintHovered = rowHovered && mouse.x >= hintPos.x && mouse.x < hintPos.x + hintSize.x &&
+                            mouse.x < cellRight && mouse.y >= hintPos.y && mouse.y < hintPos.y + lineH &&
+                            mouse.y < cellMin.y + PATCH_ROW_HEIGHT;
+                        dl->AddText(hintPos, ImGui::GetColorU32(off), "(?)");
+                    }
+                    if (hintHovered) {
+                        ImGui::BeginTooltip();
+                        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 35.0f);
+                        ImGui::TextUnformatted(description.c_str());
+                        ImGui::PopTextWrapPos();
+                        ImGui::EndTooltip();
+                    }
                     ImGui::TableSetColumnIndex(1);
                     draw_status_cell((int)k, red, off);
                     ImGui::PopID();

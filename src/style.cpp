@@ -1,4 +1,5 @@
 #include "style.h"
+#include "imgui_internal.h"
 #include <algorithm>
 
 namespace {
@@ -30,7 +31,7 @@ namespace {
 
     ImVec2 padded_tab_frame_padding() {
         ImVec2 base = ImGui::GetStyle().FramePadding;
-        return ImVec2(base.x + 10.0f, base.y + 1.0f);
+        return ImVec2(base.x + 6.0f, base.y + 1.0f);
     }
 }
 
@@ -113,7 +114,7 @@ namespace style {
         return clicked;
     }
 
-    bool begin_padded_tab_bar(const char* id) {
+    bool begin_padded_tab_bar(const char* id, float reservedRight) {
         ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, padded_tab_frame_padding());
         // ImGui draws its tab-bar border from (bottom - 1) to bottom, which
         // leaves the active tab box touching the line. Disable that built-in
@@ -122,7 +123,13 @@ namespace style {
         const ImVec2 origin = ImGui::GetCursorScreenPos();
         const float barBottom = origin.y + ImGui::GetFontSize() +
             ImGui::GetStyle().FramePadding.y * 2.0f;
+        // BeginTabBar takes its width from WorkRect, not SetNextItemWidth.
+        // Reserve only the header width; restore full-width tab contents.
+        ImGuiWindow* window = ImGui::GetCurrentWindow();
+        const float fullRight = window->WorkRect.Max.x;
+        window->WorkRect.Max.x = (std::max)(window->DC.CursorPos.x, fullRight - reservedRight);
         bool opened = ImGui::BeginTabBar(id);
+        window->WorkRect.Max.x = fullRight;
         const float lineY = barBottom + 2.0f;
         const float pad = ImGui::GetStyle().WindowPadding.x * 0.5f;
         ImGui::GetWindowDrawList()->AddRectFilled(
@@ -136,7 +143,7 @@ namespace style {
     }
 
     bool begin_padded_tab_item(const char* label) {
-        const float uniform = 90.0f;
+        const float uniform = 76.0f;
         const float space = ImGui::CalcTextSize(" ").x;
         const float width = ImGui::CalcTextSize(label).x;
         int pad = (space > 0.0f) ? (int)((uniform - width) * 0.5f / space) : 0;
